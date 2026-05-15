@@ -5185,8 +5185,6 @@ FastbootCommandSetup (IN VOID *Base, IN UINT64 Size)
   FastbootPublishVar ("gbl-chainload_mode", "mode-1");
 #elif (GBL_MODE == 2)
   FastbootPublishVar ("gbl-chainload_mode", "mode-2");
-#elif (GBL_MODE == 3)
-  FastbootPublishVar ("gbl-chainload_mode", "mode-3");
 #else
   FastbootPublishVar ("gbl-chainload_mode", "unknown");
 #endif
