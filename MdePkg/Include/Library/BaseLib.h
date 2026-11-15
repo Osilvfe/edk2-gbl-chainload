@@ -11,6 +11,23 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 #ifndef __BASE_LIB__
 #define __BASE_LIB__
 
+typedef
+INTN
+(EFIAPI *BASE_SORT_COMPARE)(
+  IN CONST VOID *Buffer1,
+  IN CONST VOID *Buffer2
+  );
+
+VOID
+EFIAPI
+QuickSort (
+  IN OUT VOID *BufferToSort,
+  IN CONST UINTN Count,
+  IN CONST UINTN ElementSize,
+  IN BASE_SORT_COMPARE CompareFunction,
+  OUT VOID *BufferOneElement
+  );
+
 //
 // Definitions for architecture-specific types
 //

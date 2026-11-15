@@ -40,6 +40,7 @@
   Include/AArch64
 
 [LibraryClasses]
+  FdtLib|Include/Library/FdtLib.h
   ##  @libraryclass  Provides most usb APIs to support the Hid requests defined in Usb Hid 1.1 spec
   #                  and the standard requests defined in Usb 1.1 spec.
   ##
@@ -277,6 +278,8 @@
   SmiHandlerProfileLib|Include/Library/SmiHandlerProfileLib.h
 
 [Guids]
+  gFdtTableGuid = { 0xb1b621d5, 0xf19c, 0x41a5, { 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0 } }
+  gLinuxEfiInitrdMediaGuid = { 0x5568e427, 0x68fc, 0x4f3d, { 0xac, 0x74, 0xca, 0x55, 0x52, 0x31, 0xcc, 0x68 } }
   #
   # GUID defined in UEFI2.1/UEFI2.0/EFI1.1
   #

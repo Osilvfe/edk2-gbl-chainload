@@ -24,6 +24,7 @@
 #
 
 [Sources]
+  QuickSort.c
   CheckSum.c
   SwitchStack.c
   SwapBytes64.c
