@@ -2392,8 +2392,7 @@ AcceptData (IN UINT64 Size, IN VOID *Data)
       FastbootOkayDelay ();
     }
   } else {
-    GetFastbootDeviceData ()->UsbDeviceProtocol->Send (
-        ENDPOINT_IN, GetXfrSize (), (Data + mBytesReceivedSoFar));
+    FastbootUsbQueueReceive (GetXfrSize (), FastbootNextDataBuffer ());
     DEBUG ((EFI_D_VERBOSE, "AcceptData: Send %d\n", GetXfrSize ()));
   }
 }
@@ -5375,6 +5374,11 @@ FastbootCommandSetup (IN VOID *Base, IN UINT64 Size)
 VOID *FastbootDloadBuffer (VOID)
 {
   return (VOID *)mUsbDataBuffer;
+}
+
+VOID *FastbootNextDataBuffer (VOID)
+{
+  return (VOID *)(mUsbDataBuffer + mBytesReceivedSoFar);
 }
 
 ANDROID_FASTBOOT_STATE FastbootCurrentState (VOID)

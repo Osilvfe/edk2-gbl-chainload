@@ -107,6 +107,10 @@ extern EFI_STATUS GblFastbootEspBootDeferred (VOID);
 /* Global fastboot data */
 static FastbootDeviceData Fbd;
 static USB_DEVICE_DESCRIPTOR_SET DescSet;
+/* Every queued OUT transfer borrows its destination until the completion
+ * event. Reusing gRxBuffer for two requests lets one host command overwrite
+ * another before its BytesCompleted event is consumed. */
+STATIC BOOLEAN mUsbRxPending;
 
 STATIC
 CONST
@@ -185,6 +189,8 @@ STATIC EFI_STATUS FastbootUsbDeviceStart (VOID)
       0xfc8d,
       0x4e44,
       {0x8c, 0x78, 0x9c, 0x9e, 0x5b, 0x53, 0xd, 0x36}};
+
+  mUsbRxPending = FALSE;
 
   Status = gBS->CreateEventEx (EVT_NOTIFY_SIGNAL, TPL_CALLBACK, DummyNotify,
                                NULL, &InitUsbControllerGuid, &UsbConfigEvt);
@@ -272,6 +278,8 @@ FastbootUsbDeviceStop (VOID)
 {
   EFI_STATUS Status;
 
+  mUsbRxPending = FALSE;
+
   /* Free the Rx & Tx Buffers */
   Status = Fbd.UsbDeviceProtocol->FreeTransferBuffer (Fbd.gTxBuffer);
   if (EFI_ERROR (Status)) {
@@ -287,6 +295,35 @@ FastbootUsbDeviceStop (VOID)
   FreePool ((DescSet.Descriptors));
   FreePool ((DescSet.SSDescriptors));
   return Status;
+}
+
+/*
+ * Queue exactly one host-to-device transfer. Both a Controller Connected
+ * event and a response completion can prime the next receive; they must
+ * converge here instead of submitting two requests backed by gRxBuffer.
+ */
+EFI_STATUS
+FastbootUsbQueueReceive (IN UINTN Size, IN VOID *Buffer)
+{
+  EFI_STATUS Status;
+
+  if (mUsbRxPending) {
+    return EFI_SUCCESS;
+  }
+  Status = Fbd.UsbDeviceProtocol->Send (ENDPOINT_IN, Size, Buffer);
+  if (!EFI_ERROR (Status)) {
+    mUsbRxPending = TRUE;
+  }
+  return Status;
+}
+
+STATIC EFI_STATUS
+FastbootUsbQueueNextReceive (VOID)
+{
+  if (FastbootCurrentState () == ExpectDataState) {
+    return FastbootUsbQueueReceive (GetXfrSize (), FastbootNextDataBuffer ());
+  }
+  return FastbootUsbQueueReceive (511, Fbd.gRxBuffer);
 }
 
 /* Process bulk transfer out come for Rx */
@@ -327,13 +364,7 @@ ProcessBulkXfrCompleteTx (IN USB_DEVICE_TRANSFER_OUTCOME *Uto)
   switch (Uto->Status) {
   case UsbDeviceTransferStatusCompleteOK:
     DEBUG ((EFI_D_VERBOSE, "UsbDeviceTransferStatusCompleteOK\n"));
-    /* Just Queue the next recieve, must be a Command */
-    if (FastbootCurrentState () == ExpectDataState)
-      Status = Fbd.UsbDeviceProtocol->Send (ENDPOINT_IN, GetXfrSize (),
-                                            FastbootDloadBuffer ());
-    else
-      Status = Fbd.UsbDeviceProtocol->Send (ENDPOINT_IN, GetXfrSize (),
-                                            Fbd.gRxBuffer);
+    Status = FastbootUsbQueueNextReceive ();
     break;
 
   case UsbDeviceTransferStatusCancelled:
@@ -362,11 +393,11 @@ EFI_STATUS HandleUsbEvents (VOID)
   if (UsbDeviceEventDeviceStateChange == Msg) {
     if (UsbDeviceStateConnected == Payload.DeviceState) {
       DEBUG ((EFI_D_VERBOSE, "Fastboot Device connected\n"));
-      /* Queue receive buffer */
-      Status = Fbd.UsbDeviceProtocol->Send (0x1, 511, Fbd.gRxBuffer);
+      Status = FastbootUsbQueueNextReceive ();
     }
     if (UsbDeviceStateDisconnected == Payload.DeviceState) {
       DEBUG ((EFI_D_VERBOSE, "Fastboot Device disconnected\n"));
+      mUsbRxPending = FALSE;
     }
   } else if (UsbDeviceEventTransferNotification == Msg) {
     /* Check if the transfer notification is on the Bulk EP and process it*/
@@ -375,6 +406,7 @@ EFI_STATUS HandleUsbEvents (VOID)
       if (USB_ENDPOINT_DIRECTION_OUT ==
           USB_INDEX_TO_EPDIR (Payload.TransferOutcome.EndpointIndex)) {
 
+        mUsbRxPending = FALSE;
         Status = ProcessBulkXfrCompleteRx (&Payload.TransferOutcome);
         if (EFI_ERROR (Status)) {
           /* Should not happen, even if it happens we keep waiting for USB to be
