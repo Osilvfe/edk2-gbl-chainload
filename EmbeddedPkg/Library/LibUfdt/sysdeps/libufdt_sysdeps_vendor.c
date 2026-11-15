@@ -188,9 +188,19 @@ void dto_qsort(void *base, size_t nmemb, size_t size,
  */
 
 static void* buffer;
+static size_t buffer_used;
 
 void* pre_overlay_malloc()
 {
+	/* A previous overlay may have exited early (ApplyOverlay returns on
+	 * failure without ever reaching post_overlay_free), so never leak the
+	 * old buffer and never reuse its bump offset for a new allocation. */
+	if (buffer != NULL) {
+		FreePool(buffer);
+		buffer = NULL;
+	}
+	buffer_used = 0;
+
 	buffer = AllocatePool(PRE_ALLOC_BUFFER_SZ);
 	if (!buffer) {
 		return NULL;
@@ -200,20 +210,28 @@ void* pre_overlay_malloc()
 
 void post_overlay_free()
 {
-	if (buffer)
+	/* Clear the pointer: ApplyOverlay's `DtsList == NULL` path reaches this
+	 * without a matching pre_overlay_malloc, and leaving a freed pointer
+	 * here turns that into a double free. */
+	if (buffer) {
 		FreePool(buffer);
+		buffer = NULL;
+	}
+	buffer_used = 0;
 }
 
 void *dto_malloc(size_t size) {
-	static int ssize = 0;
-        void *retbuf;
+	void *retbuf;
 
-	if (((MAX_UINT64 - ssize) < size) || ((ssize + size) > PRE_ALLOC_BUFFER_SZ)) {
+	if (buffer == NULL) {
+		return NULL;
+	}
+	if (size > PRE_ALLOC_BUFFER_SZ - buffer_used) {
 		return NULL;
 	}
 
-	retbuf = buffer + ssize;
-	ssize += size;
+	retbuf = (char *)buffer + buffer_used;
+	buffer_used += size;
 	return retbuf;
 }
 
