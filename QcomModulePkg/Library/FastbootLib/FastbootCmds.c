@@ -98,6 +98,14 @@ EFI_STATUS EFIAPI BootFlowChainLoad (VOID);
 #include "FastbootCmds.h"
 #include "FastbootMain.h"
 #include "LinuxLoaderLib.h"
+
+#ifdef GBL_TRACE
+/* GblChainloadPkg/Library/LogFsLib/Trace.c. */
+EFI_STATUS EFIAPI LogFsTrace (IN CONST CHAR8 *Text);
+#define GBL_TRACE_LINE(buf)  LogFsTrace (buf)
+#else
+#define GBL_TRACE_LINE(buf)  do { } while (0)
+#endif
 #include "MetaFormat.h"
 #include "SparseFormat.h"
 #include "Recovery.h"
@@ -3146,7 +3154,7 @@ CmdGetVar (CONST CHAR8 *Arg, VOID *Data, UINT32 Size)
 
 #ifdef ENABLE_BOOT_CMD
 STATIC VOID
-CmdBoot (CONST CHAR8 *Arg, VOID *Data, UINT32 Size)
+CmdBootImage (CONST CHAR8 *Arg, VOID *Data, UINT32 Size, BOOLEAN SkipDtbo)
 {
   boot_img_hdr *hdr = Data;
   boot_img_hdr_v3 *HdrV3 = Data;
@@ -3190,6 +3198,24 @@ CmdBoot (CONST CHAR8 *Arg, VOID *Data, UINT32 Size)
 
   SetBootDevImage ();
 
+  /*
+   * fastboot boot is a host-driven one-shot boot: unlike the normal boot
+   * path it must not stop in the verified-boot warning menu.  Keep the AVB
+   * verification result, but suppress the UI and its key-event wait.
+   */
+  Info.SkipVerifiedBootUi = TRUE;
+  Info.SkipDtboOverlay = SkipDtbo;
+  if (SkipDtbo) {
+    DEBUG ((EFI_D_INFO, "boot: no-dtbo requested, overlay is disabled\n"));
+  }
+  {
+    CHAR8 TraceBuf[96];
+
+    AsciiSPrint (TraceBuf, sizeof (TraceBuf),
+                 "cmd: boot size=0x%x skipdtbo=%u\n", Size, (UINT32)SkipDtbo);
+    GBL_TRACE_LINE (TraceBuf);
+  }
+
   Info.Images[0].ImageBuffer = Data;
   /* The actual image size will be updated in LoadImageAndAuth */
   Info.Images[0].ImageSize = Size;
@@ -3210,6 +3236,15 @@ CmdBoot (CONST CHAR8 *Arg, VOID *Data, UINT32 Size)
                             , &BccParamsRecvdFromAVB
   #endif
                             );
+  {
+    CHAR8 TraceBuf[96];
+
+    AsciiSPrint (TraceBuf, sizeof (TraceBuf),
+                 "cmd: avb status=%r hdr=%u imgs=%u state=%u\n", Status,
+                 Info.HeaderVersion, (UINT32)Info.NumLoadedImages,
+                 (UINT32)Info.BootState);
+    GBL_TRACE_LINE (TraceBuf);
+  }
   if (Status != EFI_SUCCESS) {
     AsciiSPrint (Resp, sizeof (Resp),
                  "Failed to load/authenticate boot image: %r", Status);
@@ -3236,10 +3271,39 @@ CmdBoot (CONST CHAR8 *Arg, VOID *Data, UINT32 Size)
   FastbootUsbDeviceStop ();
   ResetBootDevImage ();
   BootLinux (&Info);
+  {
+    CHAR8 TraceBuf[72];
+
+    AsciiSPrint (TraceBuf, sizeof (TraceBuf), "cmd: bootlinux returned\n");
+    GBL_TRACE_LINE (TraceBuf);
+  }
 
 out:
   ResetBootDevImage ();
   return;
+}
+
+STATIC VOID
+CmdBoot (CONST CHAR8 *Arg, VOID *Data, UINT32 Size)
+{
+  CmdBootImage (Arg, Data, Size, FALSE);
+}
+
+/* `oem boot-nodtbo`: boot a payload staged with `fastboot stage <boot.img>`
+ * (or any preceding download) without loading the dtbo partition or applying
+ * its overlay.  `androidboot.dtbo_idx` is suppressed as well; the base DTB
+ * still comes from the boot/vendor_boot image. */
+STATIC VOID
+CmdOemBootNoDtbo (CONST CHAR8 *Arg, VOID *Data, UINT32 Size)
+{
+  ExchangeFlashAndUsbDataBuf ();
+
+  if (mFlashDataBuffer == NULL || mFlashNumDataBytes == 0) {
+    FastbootFail ("no staged image - run `fastboot stage <boot.img>` first");
+    return;
+  }
+
+  CmdBootImage (Arg, mFlashDataBuffer, (UINT32)mFlashNumDataBytes, TRUE);
 }
 #endif
 
@@ -5206,6 +5270,7 @@ FastbootCommandSetup (IN VOID *Base, IN UINT64 Size)
 #endif
       {"oem boot-efi", CmdOemBootEfi},
       {"oem boot-efi-blockio", CmdOemBootEfiBlockIo},
+      {"oem boot-nodtbo", CmdOemBootNoDtbo},
       {"oem bcb-recovery", CmdOemBcbRecovery},
       {"oem bcb-fastboot", CmdOemBcbFastboot},
       {"oem bcb-clear", CmdOemBcbClear},

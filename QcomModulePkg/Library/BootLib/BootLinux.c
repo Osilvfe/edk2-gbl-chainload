@@ -88,6 +88,16 @@
 #include "Bootconfig.h"
 #include <ufdt_overlay.h>
 
+#ifdef GBL_TRACE
+/* GblChainloadPkg/Library/LogFsLib/Trace.c.  Flushed immediately, unlike the
+ * platform log, so the last completed step survives a hang or reset. */
+EFI_STATUS EFIAPI LogFsTrace (IN CONST CHAR8 *Text);
+EFI_STATUS EFIAPI LogFsTraceClose (VOID);
+#define GBL_TRACE_LINE(buf)  LogFsTrace (buf)
+#else
+#define GBL_TRACE_LINE(buf)  do { } while (0)
+#endif
+
 #ifndef DISABLE_KERNEL_PROTOCOL
 #include <Protocol/EFIKernelInterface.h>
 #endif
@@ -638,7 +648,22 @@ DTBImgCheckAndAppendDT (BootInfo *Info, BootParamlist *BootParamlistPtr)
           ImageBuffer = BootParamlistPtr->VendorImageBuffer;
         }
   }
-  DtboImgInvalid = LoadAndValidateDtboImg (Info, BootParamlistPtr);
+  if (BootParamlistPtr->SkipDtboOverlay) {
+    DEBUG ((EFI_D_INFO, "SkipDtboOverlay: not loading the dtbo image\n"));
+    DtboImgInvalid = FALSE;
+  } else {
+    DtboImgInvalid = LoadAndValidateDtboImg (Info, BootParamlistPtr);
+  }
+  {
+    CHAR8 TraceBuf[112];
+
+    AsciiSPrint (TraceBuf, sizeof (TraceBuf),
+                 "dtb: hdr=%u img=0x%x off=0x%x skip=%u dtbo=%u\n",
+                 HeaderVersion, ImageSize, BootParamlistPtr->DtbOffset,
+                 (UINT32)BootParamlistPtr->SkipDtboOverlay,
+                 (UINT32)DtboImgInvalid);
+    GBL_TRACE_LINE (TraceBuf);
+  }
   if (!DtboImgInvalid) {
 #ifdef AUTO_VIRT_ABL
     /* For AUTO GVM，there is no device tree to be appended,
@@ -740,6 +765,16 @@ DTBImgCheckAndAppendDT (BootInfo *Info, BootParamlist *BootParamlistPtr)
     Status = ApplyOverlay (BootParamlistPtr,
                            Dtb,
                            DtsList);
+    {
+      CHAR8 TraceBuf[112];
+
+      AsciiSPrint (TraceBuf, sizeof (TraceBuf),
+                   "dtb: appended-overlay=%r tot=0x%x room=0x%lx\n", Status,
+                   fdt_totalsize (Dtb),
+                   BootParamlistPtr->RamdiskLoadAddr -
+                     BootParamlistPtr->DeviceTreeLoadAddr);
+      GBL_TRACE_LINE (TraceBuf);
+    }
     if (Status != EFI_SUCCESS) {
       DEBUG ((EFI_D_ERROR, "Error: Dtb overlay failed\n"));
       SetVmDisable ();
@@ -772,7 +807,7 @@ DTBImgCheckAndAppendDT (BootInfo *Info, BootParamlist *BootParamlistPtr)
 #endif
 
     /*Check do we really need to gothrough DTBO or not*/
-    DtboCheckNeeded = GetDtboNeeded ();
+    DtboCheckNeeded = GetDtboNeeded () && !BootParamlistPtr->SkipDtboOverlay;
     if (DtboCheckNeeded == TRUE) {
       BoardDtb = GetBoardDtb (Info, BootParamlistPtr->DtboImgBuffer);
       if (!BoardDtb) {
@@ -932,6 +967,14 @@ GZipPkgCheck (BootParamlist *BootParamlistPtr)
     Kptr = (Kernel64Hdr *) BootParamlistPtr->KernelLoadAddr;
     DEBUG ((EFI_D_INFO, "Decompressing kernel image total time: %lu ms\n",
                          GetTimerCountms () - DecompressStartTime));
+    {
+      CHAR8 TraceBuf[96];
+
+      AsciiSPrint (TraceBuf, sizeof (TraceBuf),
+                   "kernel: gzip in=0x%x out=0x%x\n",
+                   BootParamlistPtr->KernelSize, OutLen);
+      GBL_TRACE_LINE (TraceBuf);
+    }
   } else {
     Kptr = (struct kernel64_hdr *)(BootParamlistPtr->ImageBuffer
                          + BootParamlistPtr->PageSize);
@@ -1610,6 +1653,17 @@ BootLinux (BootInfo *Info)
   Recovery = Info->BootIntoRecovery;
   AlarmBoot = Info->BootReasonAlarm;
   SilentBootMode = Info->SilentBootMode;
+  BootParamlistPtr.SkipDtboOverlay = Info->SkipDtboOverlay;
+  {
+    CHAR8  TraceBuf[96];
+    CHAR8  PnameAscii[MAX_GPT_NAME_SIZE];
+
+    UnicodeStrToAsciiStr (Info->Pname, PnameAscii);
+    AsciiSPrint (TraceBuf, sizeof (TraceBuf),
+                 "bootlinux: pname=%a skipdtbo=%u\n", PnameAscii,
+                 (UINT32)BootParamlistPtr.SkipDtboOverlay);
+    GBL_TRACE_LINE (TraceBuf);
+  }
 
   if (SilentBootMode) {
     DEBUG ((EFI_D_INFO, "Silent Mode value: %d\n", SilentBootMode));
@@ -1851,6 +1905,13 @@ BootLinux (BootInfo *Info)
 
   if (IsCarveoutRemovalEnabled ()) {
     Status = ReadRamPartitions (&RamPartitions, &NumPartitions);
+    {
+      CHAR8 TraceBuf[80];
+
+      AsciiSPrint (TraceBuf, sizeof (TraceBuf), "ram: read=%r n=%u\n",
+                   Status, NumPartitions);
+      GBL_TRACE_LINE (TraceBuf);
+    }
     if (EFI_ERROR (Status)) {
       DEBUG ((EFI_D_ERROR, "Error returned from ReadRamPartitions %r\n",
               Status));
@@ -1861,6 +1922,13 @@ BootLinux (BootInfo *Info)
                             (VOID *)BootParamlistPtr.DeviceTreeLoadAddr,
                             RamPartitions, NumPartitions,
                             UpdatedRamPartitions, &NumUpdPartitions);
+    {
+      CHAR8 TraceBuf[80];
+
+      AsciiSPrint (TraceBuf, sizeof (TraceBuf), "ram: update=%r n=%u\n",
+                   Status, NumUpdPartitions);
+      GBL_TRACE_LINE (TraceBuf);
+    }
     if (Status == EFI_SUCCESS) {
       UpdRamPartitionsAvail = TRUE;
     } else {
@@ -1877,12 +1945,25 @@ BootLinux (BootInfo *Info)
   Status = UpdateCmdLine (&BootParamlistPtr, FfbmStr, Recovery, FlashlessBoot,
                     AlarmBoot, Info->VBCmdLine, Info->HeaderVersion,
                     SilentBootMode);
+  {
+    CHAR8 TraceBuf[96];
+
+    AsciiSPrint (TraceBuf, sizeof (TraceBuf), "cmdline: status=%r len=%u\n",
+                 Status, BootParamlistPtr.FinalBootConfigLen);
+    GBL_TRACE_LINE (TraceBuf);
+  }
   if (EFI_ERROR (Status)) {
     DEBUG ((EFI_D_ERROR, "Error updating cmdline. Device Error %r\n", Status));
     return Status;
   }
 
   Status = LoadAddrAndDTUpdate (Info, &BootParamlistPtr);
+  {
+    CHAR8 TraceBuf[80];
+
+    AsciiSPrint (TraceBuf, sizeof (TraceBuf), "dt-update: status=%r\n", Status);
+    GBL_TRACE_LINE (TraceBuf);
+  }
   if (Status != EFI_SUCCESS &&
           BoardPlatformType () != EFI_PLATFORMINFO_TYPE_RUMI) {
        return Status;
@@ -1935,6 +2016,16 @@ BootLinux (BootInfo *Info)
 
   DEBUG ((EFI_D_INFO, "\nShutting Down UEFI Boot Services: %lu ms\n",
           GetTimerCountms ()));
+  {
+    CHAR8 TraceBuf[64];
+
+    AsciiSPrint (TraceBuf, sizeof (TraceBuf), "pre-ebs\n");
+    GBL_TRACE_LINE (TraceBuf);
+#ifdef GBL_TRACE
+    /* Do not hold an open FAT file across ExitBootServices. */
+    LogFsTraceClose ();
+#endif
+  }
   /*Shut down UEFI boot services*/
   Status = ShutdownUefiBootServices ();
   if (EFI_ERROR (Status)) {

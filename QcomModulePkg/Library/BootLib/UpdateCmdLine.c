@@ -736,6 +736,11 @@ UpdateCmdLineParams (UpdateCmdLineParamList *Param, CHAR8 **FinalCmdLine,
   CHAR8 *Dst;
   UINT32 MaxCmdLineLen = Param->CmdLineLen;
   BOOLEAN BootConfigFlag = FALSE;
+  /* BootForceNormalBoot is a bare CHAR8 ('0'/'1') that the bootconfig path
+   * uses with an explicit length. Appending it to the kernel cmdline needs a
+   * NUL-terminated string: passing &BootForceNormalBoot made AsciiStrCatS
+   * scan past the 1-byte object while looking for a terminator. */
+  CHAR8 ForceNormalBootStr[2] = { '0', '\0' };
 
   Dst = AllocateZeroPool (MaxCmdLineLen);
   if (!Dst) {
@@ -934,7 +939,8 @@ UpdateCmdLineParams (UpdateCmdLineParamList *Param, CHAR8 **FinalCmdLine,
     if (Param->HeaderVersion <= BOOT_HEADER_VERSION_THREE) {
       Src = AndroidBootForceNormalBoot;
       AsciiStrCatS (Dst, MaxCmdLineLen, Src);
-      Src = &BootForceNormalBoot;
+      ForceNormalBootStr[0] = BootForceNormalBoot;
+      Src = ForceNormalBootStr;
       AsciiStrCatS (Dst, MaxCmdLineLen, Src);
     }
   }

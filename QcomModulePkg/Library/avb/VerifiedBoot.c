@@ -1823,6 +1823,13 @@ DisplayVerifiedBootScreen (BootInfo *Info)
   EFI_STATUS Status = EFI_SUCCESS;
   CHAR8 FfbmStr[FFBM_MODE_BUF_SIZE] = {'\0'};
 
+  if (Info->SkipVerifiedBootUi) {
+    DEBUG ((EFI_D_INFO,
+            "fastboot boot: skipping verified-boot UI (state=%d)\n",
+            Info->BootState));
+    return EFI_SUCCESS;
+  }
+
   if (GetAVBVersion () < AVB_1) {
     return EFI_SUCCESS;
   }

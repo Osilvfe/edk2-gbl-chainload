@@ -187,6 +187,8 @@ typedef struct BootInfo {
   UINTN NumLoadedImages;
   QCOM_VERIFIEDBOOT_PROTOCOL *VbIntf;
   boot_state_t BootState;
+  BOOLEAN SkipVerifiedBootUi;
+  BOOLEAN SkipDtboOverlay;
   CHAR8 *VBCmdLine;
   UINT32 VBCmdLineLen;
   UINT32 VBCmdLineFilledLen;
@@ -262,6 +264,9 @@ typedef struct BootLinuxParamlist {
   // Filled by AVB helper functions
   VOID *PvmFwBuffer;
   UINT64 PvmFwBufferSize;
+  /* Set by `fastboot oem boot-nodtbo`: do not load or apply the dtbo
+   * partition overlay, and do not advertise androidboot.dtbo_idx. */
+  BOOLEAN SkipDtboOverlay;
 } BootParamlist;
 
 typedef struct {
