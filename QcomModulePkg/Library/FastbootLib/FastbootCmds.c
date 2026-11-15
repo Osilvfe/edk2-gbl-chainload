@@ -70,12 +70,16 @@ found at
 #include <Library/UefiRuntimeServicesTableLib.h>
 #include <Library/UnlockMenu.h>
 #include <Library/BootLinux.h>
+#include <Library/GblPayloadLib.h>
 #include <Uefi.h>
 
 #include <Guid/EventGroup.h>
 
 #include <Protocol/BlockIo.h>
+#include <Protocol/DevicePath.h>
 #include <Protocol/SimpleFileSystem.h>
+
+STATIC EFI_STATUS GblUnixnuUnpublishRamDisk (VOID);
 
 #if defined (AUTO_DEBUG_MODE) || defined (MODE_DEBUG) || defined (MODE_TEMPLATE) || defined (FAKELOCKED) || defined (FAKELOCKED_DEBUG)
 #define GBL_EXPERIMENTAL_FASTBOOT_CMDS 1
@@ -1504,11 +1508,18 @@ EFI_STATUS CreateSparseImgFlashThread (IN FlashInfo* ThreadFlashInfo)
 STATIC VOID
 CmdDownload (IN CONST CHAR8 *arg, IN VOID *data, IN UINT32 sz)
 {
+  EFI_STATUS Status;
   CHAR8 Response[13] = "DATA";
   UINT32 InitStrLen = AsciiStrLen ("DATA");
 
   CHAR16 OutputString[FASTBOOT_STRING_MAX_LENGTH];
   CHAR8 *NumBytesString = (CHAR8 *)arg;
+
+  Status = GblUnixnuUnpublishRamDisk ();
+  if (EFI_ERROR (Status)) {
+    FastbootFail ("could not detach the previous UniXNU RAM disk");
+    return;
+  }
 
   /* Argument is 8-character ASCII string hex representation of number of
    * bytes that will be sent in the data phase.Response is "DATA" + that same
@@ -2441,6 +2452,11 @@ EFI_STATUS
 FastbootCmdsUnInit (VOID)
 {
   EFI_STATUS Status;
+
+  Status = GblUnixnuUnpublishRamDisk ();
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
 
   if (mDataBuffer) {
     Status = GetFastbootDeviceData ()->UsbDeviceProtocol->FreeTransferBuffer (
@@ -4372,6 +4388,400 @@ GblFastbootReadOemUnlockAllowed (OUT UINT32 *Allowed)
   return ReadAllowUnlockValue (Allowed);
 }
 
+/* Staged FAT payload -> read-only RAM disk for the embedded UniXNU. */
+#define GBL_UNIXNU_RAM_BLOCK_SIZE  512
+#define GBL_UNIXNU_CONFIG_PATH     L"\\EFI\\UniXNU\\unixnu.toml"
+
+STATIC EFI_GUID  mGblUnixnuEmbeddedPayloadGuid = {
+  0x9b665205, 0xa133, 0x47a2,
+  { 0x93, 0x96, 0x9e, 0x2b, 0x37, 0x0a, 0x4e, 0x26 }
+};
+
+STATIC EFI_GUID  mGblUnixnuLoaderProtocolGuid = {
+  0x0f0a492e, 0x5a6a, 0x49f6,
+  { 0xa1, 0xbf, 0x74, 0x3c, 0x87, 0xab, 0x1c, 0xfe }
+};
+
+#pragma pack(1)
+typedef struct {
+  MEDIA_RAM_DISK_DEVICE_PATH  RamDisk;
+  VENDOR_DEVICE_PATH          Vendor;
+  EFI_DEVICE_PATH_PROTOCOL    End;
+} GBL_UNIXNU_RAM_DISK_DEVICE_PATH;
+#pragma pack()
+
+STATIC UINT8                              *mGblUnixnuRamBase = NULL;
+STATIC EFI_BLOCK_IO_MEDIA                  mGblUnixnuRamMedia;
+STATIC UINT32                              mGblUnixnuRamMediaId = 0x554E584E;
+STATIC EFI_HANDLE                          mGblUnixnuRamDiskHandle = NULL;
+STATIC GBL_UNIXNU_RAM_DISK_DEVICE_PATH     mGblUnixnuRamDevicePath;
+
+STATIC
+EFI_STATUS
+EFIAPI
+GblUnixnuRamReset (
+  IN EFI_BLOCK_IO_PROTOCOL  *This,
+  IN BOOLEAN                ExtendedVerification
+  )
+{
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+EFIAPI
+GblUnixnuRamReadBlocks (
+  IN  EFI_BLOCK_IO_PROTOCOL  *This,
+  IN  UINT32                 MediaId,
+  IN  EFI_LBA                Lba,
+  IN  UINTN                  BufferSize,
+  OUT VOID                   *Buffer
+  )
+{
+  UINT64  Sectors;
+
+  if (BufferSize == 0) {
+    return EFI_SUCCESS;
+  }
+  if (Buffer == NULL || mGblUnixnuRamBase == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+  if (MediaId != mGblUnixnuRamMedia.MediaId) {
+    return EFI_MEDIA_CHANGED;
+  }
+  if ((BufferSize % GBL_UNIXNU_RAM_BLOCK_SIZE) != 0) {
+    return EFI_BAD_BUFFER_SIZE;
+  }
+
+  Sectors = BufferSize / GBL_UNIXNU_RAM_BLOCK_SIZE;
+  if ((Lba > mGblUnixnuRamMedia.LastBlock) ||
+      (Sectors > (mGblUnixnuRamMedia.LastBlock + 1 - Lba))) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  CopyMem (Buffer,
+           mGblUnixnuRamBase + (UINTN)(Lba * GBL_UNIXNU_RAM_BLOCK_SIZE),
+           BufferSize);
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+EFIAPI
+GblUnixnuRamWriteBlocks (
+  IN EFI_BLOCK_IO_PROTOCOL  *This,
+  IN UINT32                 MediaId,
+  IN EFI_LBA                Lba,
+  IN UINTN                  BufferSize,
+  IN VOID                   *Buffer
+  )
+{
+  return EFI_WRITE_PROTECTED;
+}
+
+STATIC
+EFI_STATUS
+EFIAPI
+GblUnixnuRamFlushBlocks (
+  IN EFI_BLOCK_IO_PROTOCOL  *This
+  )
+{
+  return EFI_SUCCESS;
+}
+
+STATIC EFI_BLOCK_IO_PROTOCOL  mGblUnixnuRamBlockIo = {
+  EFI_BLOCK_IO_PROTOCOL_REVISION,
+  &mGblUnixnuRamMedia,
+  GblUnixnuRamReset,
+  GblUnixnuRamReadBlocks,
+  GblUnixnuRamWriteBlocks,
+  GblUnixnuRamFlushBlocks
+};
+
+STATIC
+EFI_STATUS
+GblUnixnuUnpublishRamDisk (VOID)
+{
+  EFI_STATUS  Status;
+
+  if (mGblUnixnuRamDiskHandle == NULL) {
+    return EFI_SUCCESS;
+  }
+
+  Status = gBS->DisconnectController (mGblUnixnuRamDiskHandle, NULL, NULL);
+  if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) {
+    return Status;
+  }
+  Status = gBS->UninstallMultipleProtocolInterfaces (
+                  mGblUnixnuRamDiskHandle,
+                  &gEfiDevicePathProtocolGuid, &mGblUnixnuRamDevicePath,
+                  &gEfiBlockIoProtocolGuid, &mGblUnixnuRamBlockIo,
+                  NULL
+                  );
+  if (!EFI_ERROR (Status)) {
+    mGblUnixnuRamDiskHandle = NULL;
+    mGblUnixnuRamBase = NULL;
+  }
+  return Status;
+}
+
+STATIC
+EFI_STATUS
+GblUnixnuValidateStagedFat (
+  IN CONST UINT8  *Fat,
+  IN UINTN         Size
+  )
+{
+  UINT16  BytesPerSector;
+  UINT16  ReservedSectors;
+
+  if ((Fat == NULL) || (Size < GBL_UNIXNU_RAM_BLOCK_SIZE) ||
+      ((Size % GBL_UNIXNU_RAM_BLOCK_SIZE) != 0)) {
+    return EFI_INVALID_PARAMETER;
+  }
+  if ((Fat[510] != 0x55) || (Fat[511] != 0xAA)) {
+    return EFI_UNSUPPORTED;
+  }
+
+  BytesPerSector  = ReadUnaligned16 ((CONST UINT16 *)(Fat + 11));
+  ReservedSectors = ReadUnaligned16 ((CONST UINT16 *)(Fat + 14));
+  if ((BytesPerSector != GBL_UNIXNU_RAM_BLOCK_SIZE) ||
+      (Fat[13] == 0) || (ReservedSectors == 0) || (Fat[16] == 0)) {
+    return EFI_UNSUPPORTED;
+  }
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+GblUnixnuPublishRamDisk (
+  IN UINT8  *Base,
+  IN UINTN   Size
+  )
+{
+  EFI_STATUS                       Status;
+  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL  *Fs;
+  EFI_FILE_PROTOCOL                *Root;
+  EFI_FILE_PROTOCOL                *Config;
+
+  Status = GblUnixnuUnpublishRamDisk ();
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  mGblUnixnuRamBase = Base;
+  mGblUnixnuRamMediaId++;
+  if (mGblUnixnuRamMediaId == 0) {
+    mGblUnixnuRamMediaId++;
+  }
+
+  mGblUnixnuRamMedia.MediaId          = mGblUnixnuRamMediaId;
+  mGblUnixnuRamMedia.RemovableMedia   = TRUE;
+  mGblUnixnuRamMedia.MediaPresent     = TRUE;
+  mGblUnixnuRamMedia.LogicalPartition = FALSE;
+  mGblUnixnuRamMedia.ReadOnly         = TRUE;
+  mGblUnixnuRamMedia.WriteCaching     = FALSE;
+  mGblUnixnuRamMedia.BlockSize        = GBL_UNIXNU_RAM_BLOCK_SIZE;
+  mGblUnixnuRamMedia.IoAlign          = 1;
+  mGblUnixnuRamMedia.LastBlock        =
+      (Size / GBL_UNIXNU_RAM_BLOCK_SIZE) - 1;
+
+  ZeroMem (&mGblUnixnuRamDevicePath, sizeof (mGblUnixnuRamDevicePath));
+  mGblUnixnuRamDevicePath.RamDisk.Header.Type    = MEDIA_DEVICE_PATH;
+  mGblUnixnuRamDevicePath.RamDisk.Header.SubType = MEDIA_RAM_DISK_DP;
+  mGblUnixnuRamDevicePath.RamDisk.Header.Length[0] =
+      (UINT8)sizeof (MEDIA_RAM_DISK_DEVICE_PATH);
+  mGblUnixnuRamDevicePath.RamDisk.Header.Length[1] =
+      (UINT8)(sizeof (MEDIA_RAM_DISK_DEVICE_PATH) >> 8);
+  WriteUnaligned64 (
+    (UINT64 *)&mGblUnixnuRamDevicePath.RamDisk.StartingAddr[0],
+    (UINT64)(UINTN)Base
+    );
+  WriteUnaligned64 (
+    (UINT64 *)&mGblUnixnuRamDevicePath.RamDisk.EndingAddr[0],
+    (UINT64)(UINTN)Base + Size - 1
+    );
+  CopyGuid (&mGblUnixnuRamDevicePath.RamDisk.TypeGuid,
+            &mGblUnixnuEmbeddedPayloadGuid);
+
+  mGblUnixnuRamDevicePath.Vendor.Header.Type    = HARDWARE_DEVICE_PATH;
+  mGblUnixnuRamDevicePath.Vendor.Header.SubType = HW_VENDOR_DP;
+  mGblUnixnuRamDevicePath.Vendor.Header.Length[0] =
+      (UINT8)sizeof (VENDOR_DEVICE_PATH);
+  mGblUnixnuRamDevicePath.Vendor.Header.Length[1] =
+      (UINT8)(sizeof (VENDOR_DEVICE_PATH) >> 8);
+  CopyGuid (&mGblUnixnuRamDevicePath.Vendor.Guid,
+            &mGblUnixnuEmbeddedPayloadGuid);
+
+  mGblUnixnuRamDevicePath.End.Type    = END_DEVICE_PATH_TYPE;
+  mGblUnixnuRamDevicePath.End.SubType = END_ENTIRE_DEVICE_PATH_SUBTYPE;
+  mGblUnixnuRamDevicePath.End.Length[0] = sizeof (EFI_DEVICE_PATH_PROTOCOL);
+  mGblUnixnuRamDevicePath.End.Length[1] = 0;
+
+  Status = gBS->InstallMultipleProtocolInterfaces (
+                  &mGblUnixnuRamDiskHandle,
+                  &gEfiDevicePathProtocolGuid, &mGblUnixnuRamDevicePath,
+                  &gEfiBlockIoProtocolGuid, &mGblUnixnuRamBlockIo,
+                  NULL
+                  );
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = gBS->ConnectController (mGblUnixnuRamDiskHandle, NULL, NULL, TRUE);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((EFI_D_ERROR, "UniXNU RAM disk: ConnectController %r\n", Status));
+    return Status;
+  }
+
+  Status = gBS->HandleProtocol (
+                  mGblUnixnuRamDiskHandle,
+                  &gEfiSimpleFileSystemProtocolGuid,
+                  (VOID **)&Fs
+                  );
+  if (EFI_ERROR (Status)) {
+    DEBUG ((EFI_D_ERROR, "UniXNU RAM disk: no SimpleFileSystem %r\n", Status));
+    return Status;
+  }
+
+  Status = Fs->OpenVolume (Fs, &Root);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((EFI_D_ERROR, "UniXNU RAM disk: OpenVolume %r\n", Status));
+    return Status;
+  }
+
+  Status = Root->Open (
+                   Root,
+                   &Config,
+                   GBL_UNIXNU_CONFIG_PATH,
+                   EFI_FILE_MODE_READ,
+                   0
+                   );
+  Root->Close (Root);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((EFI_D_ERROR, "UniXNU RAM disk: missing %s: %r\n",
+            GBL_UNIXNU_CONFIG_PATH, Status));
+    return Status;
+  }
+  Config->Close (Config);
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+GblUnixnuEnsureLoader (VOID)
+{
+  EFI_STATUS  Status;
+  VOID        *Existing;
+  VOID        *Efi = NULL;
+  UINT32       EfiSize = 0;
+  EFI_HANDLE   LoaderImage = NULL;
+
+  Status = gBS->LocateProtocol (&mGblUnixnuLoaderProtocolGuid, NULL, &Existing);
+  if (!EFI_ERROR (Status)) {
+    return EFI_SUCCESS;
+  }
+
+  Status = GblPayload_LoadUnixnuLoaderEfi (gImageHandle, &Efi, &EfiSize);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = gBS->LoadImage (FALSE, gImageHandle, NULL,
+                           Efi, EfiSize, &LoaderImage);
+  FreePool (Efi);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = gBS->StartImage (LoaderImage, NULL, NULL);
+  if (EFI_ERROR (Status)) {
+    gBS->UnloadImage (LoaderImage);
+    return Status;
+  }
+
+  return gBS->LocateProtocol (&mGblUnixnuLoaderProtocolGuid, NULL, &Existing);
+}
+
+/* `oem boot-unixnu`: publish the staged raw FAT as a read-only RAM disk,
+ * then start the UniXNU PE from the EFISP GBLP1 overlay.  No key or timeout
+ * path calls this command; Android remains the default boot target. */
+STATIC VOID
+CmdOemBootUnixnu (IN CONST CHAR8 *Arg, IN VOID *Data, IN UINT32 Size)
+{
+  EFI_STATUS  Status;
+  VOID        *Efi = NULL;
+  UINT32       EfiSize = 0;
+  EFI_HANDLE   ImageHandle = NULL;
+  CHAR8        Resp[MAX_RSP_SIZE];
+
+  ExchangeFlashAndUsbDataBuf ();
+  if (mFlashDataBuffer == NULL || mFlashNumDataBytes == 0) {
+    FastbootFail ("no staged FAT payload - run `fastboot stage <payload.fat>` first");
+    return;
+  }
+
+  AsciiSPrint (Resp, sizeof (Resp),
+               "publishing staged %llu bytes as UniXNU RAM disk",
+               mFlashNumDataBytes);
+  FastbootInfo (Resp);
+  WaitForTransferComplete ();
+
+  Status = GblUnixnuValidateStagedFat (mFlashDataBuffer, mFlashNumDataBytes);
+  if (EFI_ERROR (Status)) {
+    FastbootFail ("staged payload is not a raw FAT image (512-byte sectors, 0x55AA)");
+    return;
+  }
+
+  Status = GblUnixnuEnsureLoader ();
+  if (EFI_ERROR (Status)) {
+    FastbootFail ("embedded DarwinBoot loader missing or failed to start");
+    return;
+  }
+
+  Status = GblPayload_LoadUnixnuEfi (gImageHandle, &Efi, &EfiSize);
+  if (EFI_ERROR (Status)) {
+    FastbootFail ("embedded UniXNU not found or invalid in EFISP overlay");
+    return;
+  }
+
+  Status = GblUnixnuPublishRamDisk (mFlashDataBuffer, mFlashNumDataBytes);
+  if (EFI_ERROR (Status)) {
+    (VOID)GblUnixnuUnpublishRamDisk ();
+    FreePool (Efi);
+    FastbootFail ("could not publish staged FAT as a UniXNU RAM disk");
+    return;
+  }
+
+  Status = gBS->LoadImage (FALSE, gImageHandle, NULL,
+                           Efi, EfiSize, &ImageHandle);
+  FreePool (Efi);
+  if (EFI_ERROR (Status)) {
+    AsciiSPrint (Resp, sizeof (Resp), "UniXNU LoadImage failed: %r", Status);
+    (VOID)GblUnixnuUnpublishRamDisk ();
+    FastbootFail (Resp);
+    return;
+  }
+
+  ExitMenuKeysDetection ();
+  FastbootOkay ("");
+  WaitForTransferComplete ();
+  FastbootUsbDeviceStop ();
+  Finished = TRUE;
+
+  DEBUG ((EFI_D_ERROR, "oem boot-unixnu: starting embedded UniXNU (%u bytes)\n",
+          EfiSize));
+  Status = gBS->StartImage (ImageHandle, NULL, NULL);
+  DEBUG ((EFI_D_ERROR,
+          "oem boot-unixnu: StartImage returned %r (UniXNU exited)\n",
+          Status));
+  gBS->UnloadImage (ImageHandle);
+  Status = GblUnixnuUnpublishRamDisk ();
+  if (EFI_ERROR (Status)) {
+    DEBUG ((EFI_D_ERROR, "UniXNU RAM disk: cleanup failed %r\n", Status));
+  }
+}
+
 /* `oem boot-efi`: LoadImage + StartImage on the contents of the staging
  * buffer. Android `fastboot stage` is just `download:` on the wire — the
  * payload lands in mUsbDataBuffer (set by CmdDownload). The pointer swap
@@ -5270,6 +5680,7 @@ FastbootCommandSetup (IN VOID *Base, IN UINT64 Size)
 #endif
       {"oem boot-efi", CmdOemBootEfi},
       {"oem boot-efi-blockio", CmdOemBootEfiBlockIo},
+      {"oem boot-unixnu", CmdOemBootUnixnu},
       {"oem boot-nodtbo", CmdOemBootNoDtbo},
       {"oem bcb-recovery", CmdOemBcbRecovery},
       {"oem bcb-fastboot", CmdOemBcbFastboot},

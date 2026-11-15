@@ -151,12 +151,14 @@
   CompilerIntrinsicsLib
   AvbLib
   AvbParseLib
+  GblPayloadLib
 
 [Protocols]
   gEfiSimpleTextInProtocolGuid
   gEfiSimpleTextOutProtocolGuid
   gEfiBlockIoProtocolGuid
   gEfiDiskIoProtocolGuid
+  gEfiSimpleFileSystemProtocolGuid
   gEfiPartitionRecordGuid
   gEfiUsbDeviceProtocolGuid
   gEfiUsbfnIoProtocolGuid
